@@ -1,0 +1,73 @@
+{
+  "expo": {
+    "name": "Atlas",
+    "slug": "atlas-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "backgroundColor": "#1a1a1a"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Atlas needs camera access to detect and describe objects in your environment for vision assistance.",
+        "NSMicrophoneUsageDescription": "Atlas needs microphone access for audio features.",
+        "NSSpeechRecognitionUsageDescription": "Atlas needs speech recognition to provide live captions of nearby conversations for hearing assistance.",
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "bundleIdentifier": "com.risithcha.atlasmobile"
+    },
+    "android": {
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.risithcha.atlasmobile"
+    },
+    "web": {},
+    "plugins": [
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Atlas needs camera access to detect and describe objects in your environment for vision assistance.",
+          "enableMicrophonePermission": true,
+          "microphonePermissionText": "Atlas needs microphone access for audio features."
+        }
+      ],
+      [
+        "react-native-fast-tflite",
+        {
+          "enableCoreMLDelegate": true,
+          "enableAndroidGpuLibraries": false
+        }
+      ],
+      "expo-font",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Atlas needs microphone access for audio features.",
+          "speechRecognitionPermission": "Atlas needs speech recognition to provide live captions of nearby conversations for hearing assistance.",
+          "androidSpeechServicePackages": ["com.google.android.googlequicksearchbox"]
+        }
+      ],
+      [
+        "react-native-audio-api",
+        {
+          "iosMicrophonePermission": "Atlas needs microphone access to detect emergency sounds.",
+          "iosBackgroundMode": false,
+          "androidPermissions": ["android.permission.RECORD_AUDIO"],
+          "androidForegroundService": false
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "8ce24257-018a-4c4b-8a6f-a4cdbd525423"
+      }
+    }
+  }
+}

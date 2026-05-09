@@ -1,0 +1,16 @@
+# REQUIREMENTS:
+#   - Linux/WSL2/macOS
+#   - Python: 3.9, 3.10, or 3.11
+
+# Core TensorFlow - using 2.13.0 for compatibility with tflite-support 0.4.4
+tensorflow==2.13.0
+
+# NumPy - compatible with TF 2.13
+numpy>=1.23.0,<2.0.0
+
+# TFLite Support - metadata writers for object detection models
+# Version 0.4.4 is the ONLY stable version available on PyPI (0.4.3 doesn't exist!)
+tflite-support==0.4.4
+
+# FlatBuffers - required for TFLite metadata operations
+flatbuffers>=23.1.21,<24.0.0

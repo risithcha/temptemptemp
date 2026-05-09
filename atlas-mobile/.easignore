@@ -1,0 +1,43 @@
+# Monorepo siblings
+atlas-backend/
+atlas-frontend/
+model_engineering/
+charts/
+
+# Binary artifacts
+assets/Atlas.apk
+assets/Atlas2.zip
+
+# Node dependencies
+atlas-mobile/node_modules/
+node_modules/
+
+# Expo cache
+atlas-mobile/.expo/
+.expo/
+
+# Android build outputs
+atlas-mobile/android/build/
+atlas-mobile/android/.gradle/
+atlas-mobile/android/app/build/
+atlas-mobile/android/captures/
+
+# Git history
+.git/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor configs
+.vscode/
+.idea/
+
+# Test output
+coverage/
