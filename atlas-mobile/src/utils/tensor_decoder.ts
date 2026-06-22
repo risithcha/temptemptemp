@@ -1,107 +1,188 @@
-// TensorFlow Lite Object Detection Output Decoder
-// Converts raw tensor outputs from TFLite SSD models into structured detections.
-// 
-// Model outputs:
-// - Output 0 (Boxes):   [1, num_detections, 4] - Bounding boxes [y1, x1, y2, x2] (0-1 normalized)
-// - Output 1 (Classes): [1, num_detections] - Class IDs (0-90 for COCO)
-// - Output 2 (Scores):  [1, num_detections] - Confidence scores (0.0-1.0)
-// - Output 3 (Count):   [1] - Number of valid detections (optional)
+// YOLOv8 Object Detection Output Decoder
+// Converts (pre-filtered) YOLOv8 candidate outputs into structured detections.
+//
+// YOLOv8 emits a SINGLE output tensor of shape [1, 84, 8400] (channels-first):
+//   - 84 channels = 4 box (cx, cy, w, h) + 80 class scores
+//   - 8400 anchors
+//   - boxes are center-format (xywh); coordinates are either in input pixels
+//     (0..inputSize) or already normalized (0..1) depending on the export.
+//
+// The 8400-anchor sweep + confidence thresholding happens in the VisionCamera
+// worklet (see VisionScreen) so only the surviving candidates cross to JS.
+// This module performs the remaining work on that small candidate set:
+//   center->corner conversion, coordinate normalization, and per-class NMS.
 
-// COCO class labels - 91 classes mapped from model output IDs (0-90)
-// ID 0 is background/unknown
-export const COCO_CLASSES: Record<number, string> = {
-  0: '???',
-  1: 'person',
-  2: 'bicycle',
-  3: 'car',
-  4: 'motorcycle',
-  5: 'airplane',
-  6: 'bus',
-  7: 'train',
-  8: 'truck',
-  9: 'boat',
-  10: 'traffic light',
-  11: 'fire hydrant',
-  12: '???',
-  13: 'stop sign',
-  14: 'parking meter',
-  15: 'bench',
-  16: 'bird',
-  17: 'cat',
-  18: 'dog',
-  19: 'horse',
-  20: 'sheep',
-  21: 'cow',
-  22: 'elephant',
-  23: 'bear',
-  24: 'zebra',
-  25: 'giraffe',
-  26: '???',
-  27: 'backpack',
-  28: 'umbrella',
-  29: '???',
-  30: '???',
-  31: 'handbag',
-  32: 'tie',
-  33: 'suitcase',
-  34: 'frisbee',
-  35: 'skis',
-  36: 'snowboard',
-  37: 'sports ball',
-  38: 'kite',
-  39: 'baseball bat',
-  40: 'baseball glove',
-  41: 'skateboard',
-  42: 'surfboard',
-  43: 'tennis racket',
-  44: 'bottle',
-  45: '???',
-  46: 'wine glass',
-  47: 'cup',
-  48: 'fork',
-  49: 'knife',
-  50: 'spoon',
-  51: 'bowl',
-  52: 'banana',
-  53: 'apple',
-  54: 'sandwich',
-  55: 'orange',
-  56: 'broccoli',
-  57: 'carrot',
-  58: 'hot dog',
-  59: 'pizza',
-  60: 'donut',
-  61: 'cake',
-  62: 'chair',
-  63: 'couch',
-  64: 'potted plant',
-  65: 'bed',
-  66: '???',
-  67: 'dining table',
-  68: '???',
-  69: '???',
-  70: 'toilet',
-  71: '???',
-  72: 'tv',
-  73: 'laptop',
-  74: 'mouse',
-  75: 'remote',
-  76: 'keyboard',
-  77: 'cell phone',
-  78: 'microwave',
-  79: 'oven',
-  80: 'toaster',
-  81: 'sink',
-  82: 'refrigerator',
-  83: '???',
-  84: 'book',
-  85: 'clock',
-  86: 'vase',
-  87: 'scissors',
-  88: 'teddy bear',
-  89: 'hair drier',
-  90: 'toothbrush',
+// COCO-80 class labels (contiguous, 0-indexed) – the label order produced by
+// Ultralytics YOLOv8 COCO exports.  No background class, no placeholders.
+export const COCO_CLASSES_80: readonly string[] = [
+  'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+  'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+  'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+  'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag',
+  'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+  'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+  'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana',
+  'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+  'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'dining table',
+  'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+  'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock',
+  'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush',
+] as const;
+
+/** Gemini-only extras for interview / presentation rooms (not in on-device YOLO). */
+export const VISION_EXTRA_CLASSES: readonly string[] = [
+  'coffee cup',
+  'water bottle',
+  'microphone',
+  'whiteboard',
+  'projector',
+  'notepad',
+  'pen',
+  'eyeglasses',
+  'papers',
+  /** Generic electronics (Gemini-only — not brand-specific). */
+  'phone',
+  'tablet',
+  'laptop',
+  'computer',
+  'table',
+] as const;
+
+/** COCO-80 plus interview-room extras allowed for cloud vision announcements. */
+export const VISION_ALLOWED_CLASSES: readonly string[] = [
+  ...COCO_CLASSES_80,
+  ...VISION_EXTRA_CLASSES,
+] as const;
+
+const VISION_LABEL_SET = new Set<string>(VISION_ALLOWED_CLASSES);
+
+/** Common Gemini / speech variants mapped to canonical COCO-80 names. */
+const COCO_LABEL_ALIASES: Record<string, string> = {
+  human: 'person',
+  man: 'person',
+  woman: 'person',
+  people: 'person',
+  child: 'person',
+  boy: 'person',
+  girl: 'person',
+  phone: 'phone',
+  smartphone: 'phone',
+  'mobile phone': 'phone',
+  cellphone: 'phone',
+  'cell phone': 'phone',
+  telephone: 'phone',
+  tablet: 'tablet',
+  laptop: 'laptop',
+  computer: 'computer',
+  pc: 'computer',
+  desktop: 'computer',
+  'desktop computer': 'computer',
+  // Normalize common brand/model names → generic device labels
+  iphone: 'phone',
+  android: 'phone',
+  ipad: 'tablet',
+  macbook: 'laptop',
+  chromebook: 'laptop',
+  imac: 'computer',
+  television: 'tv',
+  telly: 'tv',
+  sofa: 'couch',
+  settee: 'couch',
+  plant: 'potted plant',
+  houseplant: 'potted plant',
+  flowerpot: 'potted plant',
+  bike: 'bicycle',
+  cycle: 'bicycle',
+  motorbike: 'motorcycle',
+  plane: 'airplane',
+  aeroplane: 'airplane',
+  jet: 'airplane',
+  automobile: 'car',
+  auto: 'car',
+  'traffic signal': 'traffic light',
+  stoplight: 'traffic light',
+  purse: 'handbag',
+  rucksack: 'backpack',
+  'dining table': 'table',
+  desk: 'table',
+  hotdog: 'hot dog',
+  fridge: 'refrigerator',
+  teddy: 'teddy bear',
+  'hair dryer': 'hair drier',
+  blowdryer: 'hair drier',
+  'blow dryer': 'hair drier',
+  'remote control': 'remote',
+  // Interview / presentation room extras
+  coffee: 'coffee cup',
+  'coffee mug': 'coffee cup',
+  mug: 'coffee cup',
+  mic: 'microphone',
+  mike: 'microphone',
+  glasses: 'eyeglasses',
+  spectacles: 'eyeglasses',
+  notebook: 'notepad',
+  'sticky notes': 'notepad',
+  'white board': 'whiteboard',
+  flipchart: 'whiteboard',
+  'flip chart': 'whiteboard',
+  'presentation screen': 'projector',
+  marker: 'pen',
+  pencil: 'pen',
+  paper: 'papers',
+  document: 'papers',
+  documents: 'papers',
 };
+
+/** Comma-separated allowed vision labels for Gemini prompts (COCO-80 + extras). */
+export const VISION_CLASSES_PROMPT_LIST = VISION_ALLOWED_CLASSES.join(', ');
+
+/** @deprecated Use VISION_CLASSES_PROMPT_LIST – kept for callers that only need COCO. */
+export const COCO_CLASSES_PROMPT_LIST = VISION_CLASSES_PROMPT_LIST;
+
+/**
+ * Map a free-text label to an allowed vision class (COCO-80 or interview extras), or null.
+ */
+export function resolveToVisionLabel(raw: string): string | null {
+  let normalized = raw.trim().toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ');
+  if (!normalized) return null;
+
+  if (VISION_LABEL_SET.has(normalized)) return normalized;
+
+  const alias = COCO_LABEL_ALIASES[normalized];
+  if (alias) return alias;
+
+  if (normalized.endsWith('s') && normalized.length > 3) {
+    const singular = normalized.endsWith('es')
+      ? normalized.slice(0, -2)
+      : normalized.slice(0, -1);
+    if (VISION_LABEL_SET.has(singular)) return singular;
+    const singularAlias = COCO_LABEL_ALIASES[singular];
+    if (singularAlias) return singularAlias;
+  }
+
+  return null;
+}
+
+/** @deprecated Use resolveToVisionLabel */
+export function resolveToCocoLabel(raw: string): string | null {
+  return resolveToVisionLabel(raw);
+}
+
+export function visionClassIdForLabel(label: string): number {
+  const cocoIdx = COCO_CLASSES_80.indexOf(label);
+  if (cocoIdx >= 0) return cocoIdx;
+  const extraIdx = VISION_EXTRA_CLASSES.indexOf(label);
+  if (extraIdx >= 0) return COCO_CLASSES_80.length + extraIdx;
+  return -1;
+}
+
+/** Resolve a 0-indexed COCO class id to its label, with a safe fallback. */
+export function labelForClass(
+  classId: number,
+  labels: readonly string[] = COCO_CLASSES_80,
+): string {
+  return labels[classId] ?? `class_${classId}`;
+}
 
 // Bounding box with normalized coordinates (0-1)
 export interface BoundingBox {
@@ -114,91 +195,146 @@ export interface BoundingBox {
 // Single detection result from the model
 export interface Detection {
   label: string;      // e.g., "person", "car"
-  classId: number;    // 0-90 for COCO
+  classId: number;    // 0-79 for COCO-80
   score: number;      // 0.0-1.0
   box: BoundingBox;   // normalized 0-1
 }
 
-// Raw tensor outputs from TFLite model
-export interface TFLiteOutputs {
-  boxes: Float32Array | number[];    // [1, num_detections, 4] flattened
-  classes: Float32Array | number[];  // [1, num_detections]
-  scores: Float32Array | number[];   // [1, num_detections]
-  count?: number;                    // Optional: number of valid detections
+/**
+ * Pre-filtered YOLOv8 candidates emitted by the worklet.  All three arrays are
+ * parallel: candidate `i` is `boxes[4i..4i+3]` (cx, cy, w, h), `scores[i]`,
+ * `classIds[i]`.  Coordinates may be in input-pixel or normalized space –
+ * `decodeYolo` normalizes defensively.
+ */
+export interface YoloCandidates {
+  /** Flattened center-format boxes: [cx0, cy0, w0, h0, cx1, ...] (len = 4N). */
+  boxes: number[] | Float32Array;
+  /** Per-candidate confidence = max class score (len = N). */
+  scores: number[] | Float32Array;
+  /** Per-candidate class id 0-79 (len = N). */
+  classIds: number[] | Float32Array;
 }
 
-// Decoder configuration options
-export interface DecoderOptions {
-  threshold?: number;                      // Minimum confidence (default: 0.5)
-  maxDetections?: number;                  // Max results to return (default: 10)
-  classLabels?: Record<number, string>;    // Custom class labels (default: COCO_CLASSES)
-  imageWidth?: number;                     // For pixel coordinate conversion
-  imageHeight?: number;                    // For pixel coordinate conversion
+export interface YoloDecodeOptions {
+  /** Model input size in px – used to normalize pixel-space coords. @default 640 */
+  inputSize?: number;
+  /** IoU threshold above which lower-score same-class boxes are suppressed. @default 0.45 */
+  iouThreshold?: number;
+  /** Max detections returned after NMS. @default 10 */
+  maxDetections?: number;
+  /** Custom class labels (default: COCO-80). */
+  classLabels?: readonly string[];
 }
 
-// Decode raw TFLite detection outputs into structured Detection objects.
-// Filters by confidence threshold and maps class IDs to labels.
-export function decodePredictions(
-  outputs: TFLiteOutputs,
-  options: DecoderOptions = {}
+interface ScoredBox {
+  box: BoundingBox;
+  score: number;
+  classId: number;
+}
+
+/** Intersection-over-union of two normalized boxes. */
+function iou(a: BoundingBox, b: BoundingBox): number {
+  const ix1 = Math.max(a.left, b.left);
+  const iy1 = Math.max(a.top, b.top);
+  const ix2 = Math.min(a.right, b.right);
+  const iy2 = Math.min(a.bottom, b.bottom);
+
+  const iw = Math.max(0, ix2 - ix1);
+  const ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  if (inter <= 0) return 0;
+
+  const areaA = Math.max(0, a.right - a.left) * Math.max(0, a.bottom - a.top);
+  const areaB = Math.max(0, b.right - b.left) * Math.max(0, b.bottom - b.top);
+  const union = areaA + areaB - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+/**
+ * Decode pre-filtered YOLOv8 candidates into structured detections.
+ *
+ * Pipeline: normalize coords -> center->corner -> per-class greedy NMS ->
+ * sort by score -> cap to `maxDetections`.
+ */
+export function decodeYolo(
+  candidates: YoloCandidates,
+  options: YoloDecodeOptions = {},
 ): Detection[] {
   const {
-    threshold = 0.5,
+    inputSize = 640,
+    iouThreshold = 0.45,
     maxDetections = 10,
-    classLabels = COCO_CLASSES,
+    classLabels = COCO_CLASSES_80,
   } = options;
 
-  const { boxes, classes, scores } = outputs;
-  const detections: Detection[] = [];
+  const { boxes, scores, classIds } = candidates;
+  const n = scores.length;
+  if (n === 0) return [];
 
-  // Limit to max detections or count provided by model
-  const numDetections = Math.min(
-    outputs.count ?? maxDetections,
-    maxDetections,
-    scores.length
-  );
+  // Coordinate-space auto-detection (R1): YOLOv8 exports differ – some emit
+  // pixel coords (0..inputSize), some normalized (0..1).  Scan once: if any
+  // coordinate clearly exceeds the normalized range, treat the whole batch as
+  // pixel-space and divide by inputSize.
+  let maxCoord = 0;
+  for (let i = 0; i < boxes.length; i++) {
+    const v = boxes[i];
+    if (v > maxCoord) maxCoord = v;
+  }
+  const norm = maxCoord > 1.5 && inputSize > 0 ? 1 / inputSize : 1;
 
-  for (let i = 0; i < numDetections; i++) {
-    const score = scores[i];
+  // Center-format -> corner-format normalized boxes.
+  const scored: ScoredBox[] = [];
+  for (let i = 0; i < n; i++) {
+    const cx = boxes[i * 4] * norm;
+    const cy = boxes[i * 4 + 1] * norm;
+    const w = boxes[i * 4 + 2] * norm;
+    const h = boxes[i * 4 + 3] * norm;
 
-    // Skip detections below threshold
-    if (score < threshold) {
-      continue;
-    }
+    const left = clamp01(cx - w / 2);
+    const top = clamp01(cy - h / 2);
+    const right = clamp01(cx + w / 2);
+    const bottom = clamp01(cy + h / 2);
+    if (right <= left || bottom <= top) continue;
 
-    // Get class ID and label
-    // SSD MobileNet V1 outputs 0-indexed class IDs
-    // but COCO_CLASSES is 1-indexed, so we add 1.
-    const rawClassId = Math.round(classes[i]);
-    const classId = rawClassId + 1;
-    const label = classLabels[classId] ?? `class_${classId}`;
-
-    // Skip unknown/background classes
-    if (label === '???' || classId === 0) {
-      continue;
-    }
-
-    // Extract bounding box: [y1, x1, y2, x2]
-    const boxIndex = i * 4;
-    const box: BoundingBox = {
-      top: boxes[boxIndex],      // y1
-      left: boxes[boxIndex + 1], // x1
-      bottom: boxes[boxIndex + 2], // y2
-      right: boxes[boxIndex + 3],  // x2
-    };
-
-    detections.push({
-      label,
-      classId,
-      score,
-      box,
+    scored.push({
+      box: { top, left, bottom, right },
+      score: scores[i],
+      classId: Math.round(classIds[i]),
     });
   }
 
-  // Sort by confidence score (highest first)
-  detections.sort((a, b) => b.score - a.score);
+  // Sort by confidence (highest first) for greedy NMS.
+  scored.sort((a, b) => b.score - a.score);
 
-  return detections;
+  // Per-class greedy non-max suppression.
+  const kept: Detection[] = [];
+  const suppressed = new Array<boolean>(scored.length).fill(false);
+
+  for (let i = 0; i < scored.length && kept.length < maxDetections; i++) {
+    if (suppressed[i]) continue;
+    const cur = scored[i];
+
+    kept.push({
+      label: labelForClass(cur.classId, classLabels),
+      classId: cur.classId,
+      score: cur.score,
+      box: cur.box,
+    });
+
+    for (let j = i + 1; j < scored.length; j++) {
+      if (suppressed[j]) continue;
+      if (scored[j].classId !== cur.classId) continue;
+      if (iou(cur.box, scored[j].box) > iouThreshold) {
+        suppressed[j] = true;
+      }
+    }
+  }
+
+  return kept;
+}
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
 // Convert normalized box coordinates (0-1) to pixel coordinates
@@ -259,29 +395,6 @@ export function formatDetection(
   }
 }
 
-// Decode from raw output array [boxes, classes, scores, count?]
-// Convenience function for models that return flattened outputs
-export function decodeFromRawArrays(
-  rawOutputs: (Float32Array | number[])[],
-  options: DecoderOptions = {}
-): Detection[] {
-  // Standard output order: [boxes, classes, scores, count?]
-  
-  if (rawOutputs.length < 3) {
-    console.warn('Expected at least 3 output tensors (boxes, classes, scores)');
-    return [];
-  }
-
-  const outputs: TFLiteOutputs = {
-    boxes: rawOutputs[0],
-    classes: rawOutputs[1],
-    scores: rawOutputs[2],
-    count: rawOutputs[3]?.[0],
-  };
-
-  return decodePredictions(outputs, options);
-}
-
 // Filter detections by class labels (e.g., ["person", "car"])
 export function filterByClass(
   detections: Detection[],
@@ -324,7 +437,7 @@ export interface FrameInfo {
  * so the model receives upright (portrait-oriented) content.
  *
  * Pipeline (resize plugin internals):
- *   center-crop (on raw buffer) → scale to 300×300 → rotate
+ *   center-crop (on raw buffer) → scale to model input → rotate
  *
  * Because the plugin rotates the pixel data and the Camera preview applies the
  * same rotation (but to the full frame), the model's normalised coords map
@@ -392,8 +505,8 @@ export function mapBoxToScreen(
 
 // Default export for convenience
 export default {
-  decodePredictions,
-  decodeFromRawArrays,
+  decodeYolo,
+  labelForClass,
   toPixelCoordinates,
   getBoxCenter,
   getBoxArea,
@@ -402,5 +515,5 @@ export default {
   filterByClass,
   filterByMinArea,
   mapBoxToScreen,
-  COCO_CLASSES,
+  COCO_CLASSES_80,
 };

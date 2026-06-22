@@ -39,6 +39,8 @@ export function AtlasHeader({
   onHomePress,
   onSettingsPress,
 }: AtlasHeaderProps) {
+  const subtitleOnSecondRow = Boolean(subtitle && rightContent);
+
   return (
     <SafeAreaView
       edges={['top']}
@@ -74,21 +76,27 @@ export function AtlasHeader({
           </TouchableOpacity>
         ) : null}
 
-        {/* Brand mark */}
-        <Text style={styles.logo}>ATLAS</Text>
+        <View style={styles.titleBlock}>
+          <Text style={styles.logo}>ATLAS</Text>
+          {subtitle && !subtitleOnSecondRow ? (
+            <Text
+              style={[styles.subtitle, { color: accentColor }]}
+              numberOfLines={1}
+              ellipsizeMode="tail"
+            >
+              {subtitle}
+            </Text>
+          ) : null}
+        </View>
 
-        {/* Subtitle */}
-        {subtitle ? (
-          <Text style={[styles.subtitle, { color: accentColor }]}>
-            {subtitle}
-          </Text>
+        {rightContent ? (
+          <View style={styles.rightSlot}>{rightContent}</View>
         ) : null}
-
-        {/* Spacer pushes rightContent to the edge */}
-        <View style={styles.spacer} />
-
-        {rightContent}
       </View>
+
+      {subtitleOnSecondRow ? (
+        <Text style={[styles.subtitleRow, { color: accentColor }]}>{subtitle}</Text>
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -109,7 +117,7 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   row: {
-    height: SIZES.headerHeight,
+    minHeight: SIZES.headerHeight,
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: SPACING.lg,
@@ -123,16 +131,33 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginRight: SPACING.sm,
   },
+  titleBlock: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    overflow: 'hidden',
+    marginRight: SPACING.sm,
+  },
   logo: {
     ...TYPOGRAPHY.logoSmall,
     color: COLORS.text,
     marginRight: SPACING.sm,
+    flexShrink: 0,
   },
   subtitle: {
     ...TYPOGRAPHY.subtitle,
+    flexShrink: 1,
     // color set dynamically via props
   },
-  spacer: {
-    flex: 1,
+  subtitleRow: {
+    ...TYPOGRAPHY.subtitle,
+    paddingHorizontal: SPACING.lg,
+    paddingBottom: SPACING.xs,
+    marginTop: -SPACING.xs,
+  },
+  rightSlot: {
+    flexShrink: 0,
+    marginLeft: SPACING.sm,
   },
 });

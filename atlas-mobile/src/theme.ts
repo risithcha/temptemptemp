@@ -55,13 +55,30 @@ export const BOX_COLORS = [
 ] as const;
 
 // ---------------------------------------------------------------------------
-// Model / inference constants
+// Model / inference constants  (YOLOv8s INT8 TFLite)
 // ---------------------------------------------------------------------------
-export const MODEL_INPUT_SIZE = 300;
-export const CONFIDENCE_THRESHOLD = 0.45;
+/** YOLOv8 square input resolution (640 for the standard COCO export). */
+export const MODEL_INPUT_SIZE = 640;
+/** Minimum max-class confidence to keep an anchor (YOLO needs lower than SSD). */
+export const CONFIDENCE_THRESHOLD = 0.35;
+/** Max detections returned after NMS. */
 export const MAX_DETECTIONS = 10;
+/** Object-detection inference cadence inside the frame processor. */
 export const INFERENCE_FPS = 5;
+/** Drop detections whose normalized box area is below this (noise filter). */
 export const MIN_BOX_AREA = 0.005;
+/** IoU threshold for per-class non-max suppression. */
+export const NMS_IOU_THRESHOLD = 0.45;
+/** Number of COCO classes in the YOLOv8 output tensor. */
+export const YOLO_NUM_CLASSES = 80;
+/**
+ * Output dequantization (R1).  For a float32-output export these stay identity
+ * (`scale=1, zeroPoint=0`).  For a full-INT8 export, set them to the model's
+ * output tensor `quantization` params so the worklet can map int8 -> float:
+ *   value = (raw - YOLO_OUTPUT_ZERO_POINT) * YOLO_OUTPUT_SCALE
+ */
+export const YOLO_OUTPUT_SCALE = 1;
+export const YOLO_OUTPUT_ZERO_POINT = 0;
 
 // ---------------------------------------------------------------------------
 // TTS announcement constants
@@ -82,12 +99,31 @@ export const OCR_SIMILARITY_THRESHOLD = 0.7;
 export const OCR_CACHE_TTL_MS = 30_000;
 
 // ---------------------------------------------------------------------------
+// Deepgram streaming STT constants
+// ---------------------------------------------------------------------------
+/**
+ * Preferred PCM sample rate requested from the recorder's `onAudioReady` tap
+ * and used to stream to Deepgram.  Hardware may override this (R9) – the actual
+ * delivered `buffer.sampleRate` is always trusted when opening the WebSocket.
+ */
+export const PCM_TAP_SAMPLE_RATE = 16000;
+/** Mono PCM for speech. */
+export const PCM_TAP_CHANNELS = 1;
+/** Deepgram realtime listen endpoint (sample_rate appended at connect time). */
+export const DEEPGRAM_WS_BASE =
+  'wss://api.deepgram.com/v1/listen?model=nova-3&diarize=true&punctuate=true&language=en-US&encoding=linear16&channels=1';
+/** Interval (ms) between Deepgram KeepAlive messages to hold the socket open. */
+export const DEEPGRAM_KEEPALIVE_MS = 8000;
+
+// ---------------------------------------------------------------------------
 // Alarm detector constants
 // ---------------------------------------------------------------------------
 /** FFT size for the AnalyserNode (must be power of 2). */
 export const ALARM_FFT_SIZE = 2048;
-/** Consecutive detection frames required before confirming an alert. */
-export const ALARM_CONSECUTIVE_FRAMES = 5;
+/** Consecutive detection frames required before confirming an alert.
+ *  Logs showed the signal hits 3-4/5 consistently but drops before 5 due to
+ *  natural amplitude fluctuation in alarm tones.  3 frames = 300 ms. */
+export const ALARM_CONSECUTIVE_FRAMES = 3;
 /** Interval (ms) between FFT reads. */
 export const ALARM_POLL_INTERVAL_MS = 100;
 /** Auto-clear alert after this many ms of no spike. */

@@ -42,7 +42,7 @@
         "react-native-fast-tflite",
         {
           "enableCoreMLDelegate": true,
-          "enableAndroidGpuLibraries": false
+          "enableAndroidGpuLibraries": true
         }
       ],
       "expo-font",

@@ -1,13 +1,5 @@
 /**
  * VisionScreen – Camera-based object detection with real-time bounding boxes.
- *
- * Extracted from the original monolithic App.tsx.  Now lives as a dedicated
- * screen inside the React Navigation tab navigator.
- *
- * Key lifecycle behaviour:
- *   • Camera `isActive` is tied to `useIsFocused()` so the camera pauses
- *     when the user switches to another tab (saves battery and hides the iOS
- *     green privacy indicator).
  */
 import { StatusBar } from 'expo-status-bar';
 import {
@@ -18,56 +10,29 @@ import {
   Pressable,
   Platform,
   ActivityIndicator,
-  Dimensions,
 } from 'react-native';
 import {
   Camera,
   useCameraDevice,
   useCameraPermission,
-  useFrameProcessor,
-  runAtTargetFps,
 } from 'react-native-vision-camera';
-import { useTensorflowModel } from 'react-native-fast-tflite';
-import { useResizePlugin } from 'vision-camera-resize-plugin';
-import { useTextRecognition } from 'react-native-vision-camera-ocr-plus';
-import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
-import { Worklets } from 'react-native-worklets-core';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useIsFocused, useNavigation } from '@react-navigation/native';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import Constants from 'expo-constants';
 
-import { useAppState, useVisionAnnouncer, useOcrAutoReader } from '../hooks';
+import { useAppState, useVisionAssist, useOcrAutoReader } from '../hooks';
 import { triggerHaptic } from '../utils/haptics';
 import { useSettings } from '../contexts/SettingsContext';
 
-import {
-  DetectionOverlay,
-  AtlasHeader,
-  ActionButton,
-  OcrTextPanel,
-} from '../components';
-import {
-  decodePredictions,
-  filterByMinArea,
-  type Detection,
-  type TFLiteOutputs,
-  type FrameInfo,
-} from '../utils/tensor_decoder';
-import { sanitizeOcrText } from '../utils/ocr_utils';
+import { AtlasHeader, ActionButton, OcrTextPanel } from '../components';
 import {
   COLORS,
   TYPOGRAPHY,
   SPACING,
   RADII,
   SIZES,
-  MODEL_INPUT_SIZE,
-  CONFIDENCE_THRESHOLD,
-  MAX_DETECTIONS,
-  INFERENCE_FPS,
-  MIN_BOX_AREA,
-  OCR_FPS,
 } from '../theme';
-
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 
 // ---------------------------------------------------------------------------
 // VisionScreen
@@ -85,158 +50,56 @@ export default function VisionScreen() {
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice(facing);
 
-  // --- Model loading ---
-  const tfModel = useTensorflowModel(
-    require('../../assets/models/atlas_mobilenet_quant.tflite'),
-  );
-  const model = tfModel.state === 'loaded' ? tfModel.model : undefined;
+  const visionApiKey =
+    (Constants.expoConfig?.extra as Record<string, string> | undefined)
+      ?.geminiKey ?? '';
 
-  // --- Resize plugin ---
-  const { resize } = useResizePlugin();
+  // Imperative camera handle – used to grab still snapshots.
+  const cameraRef = useRef<Camera | null>(null);
 
-  // --- Detection state ---
-  const [detections, setDetections] = useState<Detection[]>([]);
-  const [frameInfo, setFrameInfo] = useState<FrameInfo | null>(null);
-  const [fps, setFps] = useState(0);
-  const lastInferenceRef = useRef(Date.now());
+  // Camera is not ready to snapshot until onInitialized fires.
+  const [isCameraReady, setIsCameraReady] = useState(false);
+  const onCameraInitialized = useCallback(() => setIsCameraReady(true), []);
 
-  // --- OCR state ---
-  const [ocrText, setOcrText] = useState('');
-  const ocrOptions = useMemo(
-    () => ({ language: 'latin' as const, useLightweightMode: true }),
-    [],
-  );
-  const { scanText } = useTextRecognition(ocrOptions);
+  // Reset readiness whenever the device changes (e.g. front/back flip).
+  const prevDeviceRef = useRef(device);
+  useEffect(() => {
+    if (prevDeviceRef.current !== device) {
+      prevDeviceRef.current = device;
+      setIsCameraReady(false);
+    }
+  }, [device]);
 
-  // Bridge: worklet → JS thread
-  // Wrapped in useRef so we only create the bridge once – calling
-  // Worklets.createRunOnJS on every render can cause race conditions.
-  const detectionCallbackRef = useRef((
-    rawBoxes: number[],
-    rawClasses: number[],
-    rawScores: number[],
-    rawCount: number,
-    fWidth: number,
-    fHeight: number,
-    fOrientation: string,
-  ) => {
-      const now = Date.now();
-      const delta = now - lastInferenceRef.current;
-      lastInferenceRef.current = now;
-      if (delta > 0) setFps(Math.round(1000 / delta));
+  const visionActive = isScreenActive && isCameraReady;
 
-      setFrameInfo({
-        frameWidth: fWidth,
-        frameHeight: fHeight,
-        frameOrientation: fOrientation,
-      });
-
-      const outputs: TFLiteOutputs = {
-        boxes: rawBoxes,
-        classes: rawClasses,
-        scores: rawScores,
-        count: rawCount,
-      };
-
-      let results = decodePredictions(outputs, {
-        threshold: CONFIDENCE_THRESHOLD,
-        maxDetections: MAX_DETECTIONS,
-      });
-      results = filterByMinArea(results, MIN_BOX_AREA);
-      setDetections(results);
-    });
-
-  const onDetectionResults = useMemo(
-    () => Worklets.createRunOnJS(detectionCallbackRef.current),
-    [],
-  );
-
-  // Bridge: worklet -> JS thread for OCR results
-  const ocrCallbackRef = useRef((text: string) => {
-    const cleaned = sanitizeOcrText(text);
-    setOcrText(cleaned);
+  const {
+    detections,
+    fps,
+    ocrText,
+    frameProcessor,
+    needsPhoto,
+    pipelineReady,
+    modelLoading,
+  } = useVisionAssist({
+    cameraRef,
+    apiKey: visionApiKey,
+    isActive: visionActive,
+    ttsRate: settings.ttsRate,
   });
 
-  const onOcrResults = useMemo(
-    () => Worklets.createRunOnJS(ocrCallbackRef.current),
-    [],
-  );
+  const { handleTap: handleOcrTap, playbackState } =
+    useOcrAutoReader(ocrText, visionActive, {
+      ttsRate: settings.ttsRate,
+    });
 
-  // --- Frame Processor ---
-  const frameProcessor = useFrameProcessor(
-    (frame) => {
-      'worklet';
-      if (model == null) return;
+  const showDetecting =
+    isCameraReady && pipelineReady && visionActive;
 
-      // Object detection at INFERENCE_FPS (5 fps)
-      runAtTargetFps(INFERENCE_FPS, () => {
-        'worklet';
-
-        const orientation = frame.orientation;
-        const rotation =
-          orientation === 'landscape-left'
-            ? '90deg'
-            : orientation === 'landscape-right'
-              ? '270deg'
-              : orientation === 'portrait-upside-down'
-                ? '180deg'
-                : '0deg';
-
-        const resized = resize(frame, {
-          scale: {
-            width: MODEL_INPUT_SIZE,
-            height: MODEL_INPUT_SIZE,
-          },
-          rotation,
-          pixelFormat: 'rgb',
-          dataType: 'uint8',
-        });
-
-        const outputs = model.runSync([resized]);
-
-        const rawBoxes = Array.from(outputs[0] as unknown as number[]);
-        const rawClasses = Array.from(outputs[1] as unknown as number[]);
-        const rawScores = Array.from(outputs[2] as unknown as number[]);
-        const rawCount = outputs[3]
-          ? (outputs[3] as unknown as number[])[0]
-          : 0;
-
-        onDetectionResults(
-          rawBoxes,
-          rawClasses,
-          rawScores,
-          rawCount,
-          frame.width,
-          frame.height,
-          frame.orientation,
-        );
-      });
-
-      // OCR at OCR_FPS (1 fps) - text doesn't change as fast as objects
-      runAtTargetFps(OCR_FPS, () => {
-        'worklet';
-        const result = scanText(frame);
-        if (result?.resultText != null && result.resultText.length > 0) {
-          onOcrResults(result.resultText);
-        }
-      });
-    },
-    [model, resize, onDetectionResults, scanText, onOcrResults],
-  );
-
-  // Toggle camera facing
+  // --- Camera controls ---
   const toggleCameraFacing = useCallback(() => {
     triggerHaptic('toggle');
     setFacing((c) => (c === 'back' ? 'front' : 'back'));
   }, []);
-
-  // --- TTS announcements for detected objects ---
-  useVisionAnnouncer(detections, isScreenActive, { ttsRate: settings.ttsRate });
-
-  // --- Smart OCR auto-reader (reads new text, skips duplicates) ---
-  const { readLatestAloud } = useOcrAutoReader(ocrText, isScreenActive, {
-    ttsRate: settings.ttsRate,
-  });
 
   const goHome = useCallback(() => {
     triggerHaptic('selection');
@@ -248,34 +111,7 @@ export default function VisionScreen() {
     navigation.navigate('Settings');
   }, [navigation]);
 
-  // --- Render: loading / error / permission / camera ---
-
-  if (tfModel.state === 'loading') {
-    return (
-      <View style={styles.container}>
-        <StatusBar style="light" />
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color={COLORS.primary} />
-          <Text style={styles.loadingText}>Loading Atlas AI...</Text>
-        </View>
-      </View>
-    );
-  }
-
-  if (tfModel.state === 'error') {
-    return (
-      <View style={styles.container}>
-        <StatusBar style="light" />
-        <View style={styles.loadingContainer}>
-          <Ionicons name="alert-circle" size={64} color={COLORS.danger} />
-          <Text style={styles.errorTitle}>Model Error</Text>
-          <Text style={styles.loadingText}>
-            {tfModel.error?.message ?? 'Unknown error'}
-          </Text>
-        </View>
-      </View>
-    );
-  }
+  // --- Render: permission / device guards ---
 
   if (!hasPermission) {
     return (
@@ -315,78 +151,104 @@ export default function VisionScreen() {
     );
   }
 
+  if (modelLoading && visionActive) {
+    return (
+      <View style={styles.container}>
+        <StatusBar style="light" />
+        <AtlasHeader
+          subtitle="Vision Assist"
+          accentColor={COLORS.secondary}
+          onHomePress={goHome}
+          onSettingsPress={goSettings}
+        />
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color={COLORS.secondary} />
+          <Text style={styles.loadingText}>Loading model...</Text>
+        </View>
+      </View>
+    );
+  }
+
   // ---- Main camera view ----
   return (
-    <Pressable style={styles.container} onPress={readLatestAloud}>
+    <View style={styles.container}>
       <StatusBar style="light" />
 
-      {/* Camera – isActive driven by navigation focus */}
       <Camera
+        ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={isScreenActive}
-        frameProcessor={frameProcessor}
+        photo={needsPhoto}
         pixelFormat="yuv"
+        frameProcessor={frameProcessor}
         resizeMode="cover"
+        onInitialized={onCameraInitialized}
       />
 
-      {/* Bounding-box overlay */}
-      <DetectionOverlay detections={detections} frameInfo={frameInfo} />
-
-      {/* OCR text panel (between overlay and bottom bar) */}
-      <OcrTextPanel text={ocrText} fontSize={settings.captionFontSize} />
-
-      {/* Top bar – unified header (transparent over camera) */}
-      <AtlasHeader
-        subtitle="Vision Assist"
-        accentColor={COLORS.secondary}
-        transparent
-        onHomePress={goHome}
-        onSettingsPress={goSettings}
-        rightContent={
-          <View style={styles.topBarRight}>
-            {detections.length > 0 && (
-              <View style={styles.countBadge}>
-                <Text style={styles.countText}>{detections.length}</Text>
-              </View>
-            )}
-            <TouchableOpacity
-              style={styles.flipButton}
-              onPress={toggleCameraFacing}
-              activeOpacity={0.7}
-            >
-              <Ionicons
-                name="camera-reverse-outline"
-                size={28}
-                color={COLORS.text}
-              />
-            </TouchableOpacity>
-          </View>
-        }
+      {/* Tap layer sits above camera, below header controls (overlay is box-none). */}
+      <Pressable
+        style={styles.tapLayer}
+        onPress={handleOcrTap}
+        accessibilityRole="button"
+        accessibilityLabel="Vision camera. Tap to control text reading. Double tap to restart."
+        accessibilityHint="Tap stops or pauses speech. Tap again to resume or start reading detected text."
       />
 
-      {/* Bottom overlay */}
-      <View style={styles.bottomOverlay}>
+      <View style={styles.overlayLayer} pointerEvents="box-none">
+        <AtlasHeader
+          subtitle="Vision Assist"
+          accentColor={COLORS.secondary}
+          transparent
+          onHomePress={goHome}
+          onSettingsPress={goSettings}
+          rightContent={
+            <View style={styles.topBarRight}>
+              {detections.length > 0 && (
+                <View style={styles.countBadge}>
+                  <Text style={styles.countText}>{detections.length}</Text>
+                </View>
+              )}
+              <TouchableOpacity
+                style={styles.flipButton}
+                onPress={toggleCameraFacing}
+                activeOpacity={0.7}
+              >
+                <Ionicons
+                  name="camera-reverse-outline"
+                  size={28}
+                  color={COLORS.text}
+                />
+              </TouchableOpacity>
+            </View>
+          }
+        />
+
+        <OcrTextPanel text={ocrText} playbackState={playbackState} />
+
+        <View style={styles.bottomOverlay} pointerEvents="none">
         <View style={styles.statusContainer}>
           <View
             style={[
               styles.statusDot,
               {
                 backgroundColor:
-                  model != null ? COLORS.primary : COLORS.textMuted,
+                  showDetecting ? COLORS.primary : COLORS.textMuted,
               },
             ]}
           />
           <Text style={styles.statusText}>
-            {model != null
-              ? `Detecting \u2022 ${fps} inf/s`
+            {isCameraReady
+              ? showDetecting
+                ? `Detecting \u2022 ${fps} inf/s`
+                : 'Loading model...'
               : 'Loading model...'}
           </Text>
         </View>
 
         <Text style={styles.fpsText}>
-          Model: {MODEL_INPUT_SIZE}x{MODEL_INPUT_SIZE} UINT8 •{' '}
-          {detections.length} object{detections.length !== 1 ? 's' : ''}
+          Model: 300x300 UINT8 • {detections.length} object
+          {detections.length !== 1 ? 's' : ''}
         </Text>
 
         {detections.length > 0 && (
@@ -398,8 +260,9 @@ export default function VisionScreen() {
             ))}
           </View>
         )}
+        </View>
       </View>
-    </Pressable>
+    </View>
   );
 }
 
@@ -410,6 +273,14 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.background,
+  },
+  tapLayer: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 1,
+  },
+  overlayLayer: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 2,
   },
 
   // Loading / Error
@@ -462,7 +333,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: SPACING.lg,
   },
 
-  // Top bar overlay
+  // Top bar controls
   topBarRight: {
     flexDirection: 'row',
     alignItems: 'center',

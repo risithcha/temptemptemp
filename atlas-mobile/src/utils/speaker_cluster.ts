@@ -4,14 +4,6 @@
  * Assigns speech segments to speaker profiles using a range-normalized
  * (2+N)D Euclidean distance over fundamental frequency (F0), spectral
  * centroid (timbre), and N log Mel-band energies (vocal tract shape).
- * The Mel dimensions separate voices that share similar F0 and room
- * resonance but differ in formant structure or phonetic quality.
- *
- * All features are normalized before distance calculation so no single
- * dimension dominates:
- *   - Pitch:       75-400 Hz    (range 325 Hz)
- *   - Centroid:    300-3000 Hz  (range 2700 Hz)
- *   - Mel band k:  [0, MEL_FEATURE_RANGE]  (log-energy, normalized)
  */
 
 import {
@@ -36,7 +28,6 @@ export interface SpeakerProfile {
   label: string;
   avgPitch: number;
   avgCentroid: number;
-  /** Running per-band log Mel-energy averages for (2+N)D clustering. */
   avgFeatures: number[];
   sampleCount: number;
 }
@@ -64,17 +55,6 @@ function normalizedDistance(
   return Math.sqrt(dp * dp + dc * dc + MEL_FEATURE_WEIGHT * melSumSq);
 }
 
-/**
- * Assign a speech segment (identified by its median pitch, median centroid,
- * and median log Mel-band energies) to the closest existing speaker profile,
- * or create a new one if no match falls within the tolerance.
- *
- * @param lastActiveSpeakerLabel  Label of the speaker who spoke most recently.
- *   When provided, that profile's raw distance is multiplied by
- *   `SPEAKER_STICKY_FACTOR` (< 1) before comparison.  This implements
- *   hysteresis: borderline segments prefer to merge with the ongoing speaker
- *   rather than creating a spurious new profile across short pauses.
- */
 export function assignSpeaker(
   medianPitch: number,
   medianCentroid: number,
@@ -94,7 +74,6 @@ export function assignSpeaker(
     return { label: newProfile.label, profiles: [newProfile] };
   }
 
-  // Compute raw distance for profile 0 and apply sticky discount if applicable.
   const rawDist0 = normalizedDistance(
     medianPitch, medianCentroid, medianFeatures,
     profiles[0].avgPitch, profiles[0].avgCentroid, profiles[0].avgFeatures,
@@ -110,8 +89,6 @@ export function assignSpeaker(
       medianPitch, medianCentroid, medianFeatures,
       profiles[i].avgPitch, profiles[i].avgCentroid, profiles[i].avgFeatures,
     );
-    // Apply the sticky discount to the last-active speaker so borderline
-    // segments merge with it rather than spawning a new profile.
     const dist =
       lastActiveSpeakerLabel !== null && profiles[i].label === lastActiveSpeakerLabel
         ? rawDist * SPEAKER_STICKY_FACTOR
@@ -149,7 +126,6 @@ export function assignSpeaker(
     return { label: newProfile.label, profiles };
   }
 
-  // Cap reached - assign to the closest anyway.
   const p = profiles[bestIdx];
   p.avgPitch =
     (p.avgPitch * p.sampleCount + medianPitch) / (p.sampleCount + 1);
@@ -164,9 +140,6 @@ export function assignSpeaker(
   return { label: p.label, profiles };
 }
 
-/**
- * Compute the median of a numeric array.  Returns `null` for empty input.
- */
 export function median(values: number[]): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -176,13 +149,6 @@ export function median(values: number[]): number | null {
     : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-/**
- * Compute a weighted median.  Each value[i] is paired with weight[i]
- * (must be > 0).  Returns `null` when no valid pairs exist.
- *
- * Algorithm: sort by value, accumulate weights until >= half of total weight.
- * O(n log n) - negligible for the small sample counts we process (< 100).
- */
 export function weightedMedian(
   values: number[],
   weights: number[],

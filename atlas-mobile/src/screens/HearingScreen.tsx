@@ -8,6 +8,22 @@
  * Lifecycle:
  *   • Stops listening when the screen loses focus (tab switch) and does
  *     NOT auto-resume. The user is always in control via the toggle.
+ *
+ * Audio architecture:
+ *   • useAlarmDetector is the SINGLE mic owner via react-native-audio-api.
+ *     Its raw PCM tap (onPcm) is wired to Deepgram via useSpeechRecognition's
+ *     pushPcm, so there is exactly one recorder session.
+ *   • useSpeechRecognition is declared first only to get pushPcm before
+ *     passing it to the alarm detector.  The alarm detector MUST be started
+ *     first (it grabs the mic before speech recognition sets up anything).
+ *   • On start:  startMonitoring() grabs the mic; startListening() opens the
+ *     Deepgram WebSocket (or expo fallback).
+ *   • On stop:   stopMonitoring() FIRST (releases audio session cleanly),
+ *     then stopListening() (closes the WebSocket / expo session).
+ *
+ * IMPORTANT: The stop condition checks BOTH isListening and isMonitoring to
+ * avoid a double-start race where pressing the button quickly could call
+ * startMonitoring() twice.
  */
 import { StatusBar } from 'expo-status-bar';
 import {
@@ -17,7 +33,8 @@ import {
   ScrollView,
   Platform,
 } from 'react-native';
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import Constants from 'expo-constants';
 import { useIsFocused, useNavigation } from '@react-navigation/native';
 import Animated, {
   useSharedValue,
@@ -29,11 +46,22 @@ import Animated, {
 } from 'react-native-reanimated';
 import Ionicons from '@expo/vector-icons/Ionicons';
 
-import { useSpeechRecognition, useAppState, useAlarmDetector } from '../hooks';
+import { useSpeechRecognition, useAppState, useAlarmDetector, useGeminiAudio } from '../hooks';
+import type { AlarmAlert } from '../hooks/useAlarmDetector';
 import { triggerHaptic } from '../utils/haptics';
 import { useSettings } from '../contexts/SettingsContext';
 import { COLORS, RADII, SPACING, TYPOGRAPHY, SIZES } from '../theme';
 import { AtlasHeader, ActionButton, AlertOverlay } from '../components';
+
+const TAG = '[HearingScreen]';
+
+/** Gemini must exceed this to show an alert (reduces false positives on room noise). */
+const GEMINI_MIN_CONFIDENCE = 0.85;
+/** After Gemini rejects, ignore new anomalies for this long. */
+const GEMINI_REJECT_COOLDOWN_MS = 12_000;
+/** Screen-level retries when Gemini returns unavailable (503, etc.). */
+const GEMINI_UNAVAILABLE_RETRIES = 3;
+const GEMINI_UNAVAILABLE_RETRY_BASE_MS = 1500;
 
 // ---------------------------------------------------------------------------
 // HearingScreen
@@ -44,17 +72,24 @@ export default function HearingScreen() {
   const appState = useAppState();
   const settings = useSettings();
   const scrollRef = useRef<ScrollView>(null);
+  const pushPcmRef = useRef<(samples: Float32Array, sampleRate: number) => void>(() => {});
 
-  // Alarm detector MUST be declared first - it owns the mic / AnalyserNode
-  // and exposes pitchHistoryRef consumed by speech recognition below.
+  console.log(`${TAG} render | isFocused=${isFocused} appState=${appState}`);
+
+  // Alarm detector is the SINGLE mic owner and feeds pitch history for diarization.
   const {
-    alert,
+    alert, // Using anomaly instead
+    anomaly,
     isMonitoring,
     startMonitoring,
     stopMonitoring,
     dismissAlert,
+    releaseAnomalyDebounce,
     pitchHistoryRef,
-  } = useAlarmDetector({ peakThreshold: settings.crisisThreshold });
+  } = useAlarmDetector({
+    peakThreshold: settings.crisisThreshold,
+    onPcm: (samples, sampleRate) => pushPcmRef.current(samples, sampleRate),
+  });
 
   const {
     text,
@@ -66,6 +101,7 @@ export default function HearingScreen() {
     startListening,
     stopListening,
     resetTranscript,
+    pushPcm,
   } = useSpeechRecognition({
     lang: 'en-US',
     continuous: true,
@@ -73,15 +109,164 @@ export default function HearingScreen() {
     pitchHistoryRef,
   });
 
-  // --- Stop listening when navigating away or app backgrounds ---
-  // Stop alarm detector FIRST so it releases the audio session before
-  // speech recognition tries to shut down (prevents "client" error).
+  pushPcmRef.current = pushPcm;
+
+  const geminiKey = Constants.expoConfig?.extra?.geminiKey ?? '';
+  const { classifyAlarm } = useGeminiAudio(geminiKey);
+  const [verifiedAlert, setVerifiedAlert] = useState<AlarmAlert | null>(null);
+  const lastAnomalyRef = useRef<number | null>(null);
+  const validatingRef = useRef(false);
+  const rejectCooldownUntilRef = useRef(0);
+  const unavailableRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMonitoringRef = useRef(isMonitoring);
+  isMonitoringRef.current = isMonitoring;
+
+  const stopMonitoringRef = useRef(stopMonitoring);
+  const stopListeningRef = useRef(stopListening);
+  stopMonitoringRef.current = stopMonitoring;
+  stopListeningRef.current = stopListening;
+
+  const isListeningRef = useRef(isListening);
+  isListeningRef.current = isListening;
+
+  const validateAnomaly = useCallback(
+    async (
+      pcmSnapshot: Float32Array,
+      sampleRate: number,
+      bandLabel: string | undefined,
+      timestamp: number,
+      unavailableAttempt = 0,
+    ) => {
+      const now = Date.now();
+      if (now < rejectCooldownUntilRef.current) {
+        console.log(
+          `${TAG} Validation skipped – Gemini reject cooldown (${Math.ceil((rejectCooldownUntilRef.current - now) / 1000)}s left)`,
+        );
+        return;
+      }
+
+      if (validatingRef.current) {
+        console.log(`${TAG} Validation skipped – already in progress`);
+        return;
+      }
+
+      validatingRef.current = true;
+      const attemptLabel =
+        unavailableAttempt > 0
+          ? ` (retry ${unavailableAttempt + 1}/${GEMINI_UNAVAILABLE_RETRIES + 1})`
+          : '';
+      console.log(
+        `${TAG} 🤖 Sending 3-second PCM snapshot to Gemini for validation${attemptLabel}...`,
+      );
+
+      try {
+        const res = await classifyAlarm(pcmSnapshot, sampleRate, bandLabel);
+
+        if (res.status === 'confirmed') {
+          if (res.alert.confidence < GEMINI_MIN_CONFIDENCE) {
+            console.log(
+              `${TAG} ❌ Gemini confidence too low (${res.alert.confidence.toFixed(2)} < ${GEMINI_MIN_CONFIDENCE})`,
+            );
+            releaseAnomalyDebounce();
+            return;
+          }
+          console.log(`${TAG} ✅ Gemini confirmed alarm:`, res.alert.type);
+          lastAnomalyRef.current = timestamp;
+          setVerifiedAlert(res.alert);
+          return;
+        }
+
+        if (res.status === 'rejected') {
+          console.log(`${TAG} ❌ Gemini rejected alarm (FALSE_ALARM)`);
+          lastAnomalyRef.current = timestamp;
+          rejectCooldownUntilRef.current = Date.now() + GEMINI_REJECT_COOLDOWN_MS;
+          return;
+        }
+
+        console.warn(`${TAG} ⚠️ Gemini unavailable (${res.reason}) – will retry`);
+        releaseAnomalyDebounce();
+
+        if (
+          unavailableAttempt < GEMINI_UNAVAILABLE_RETRIES &&
+          isMonitoringRef.current
+        ) {
+          const delay = GEMINI_UNAVAILABLE_RETRY_BASE_MS * (unavailableAttempt + 1);
+          console.log(`${TAG} Scheduling Gemini retry in ${delay}ms...`);
+          unavailableRetryTimerRef.current = setTimeout(() => {
+            void validateAnomaly(
+              pcmSnapshot,
+              sampleRate,
+              bandLabel,
+              timestamp,
+              unavailableAttempt + 1,
+            );
+          }, delay);
+        }
+      } catch (e) {
+        console.error(`${TAG} Gemini error:`, e);
+        releaseAnomalyDebounce();
+      } finally {
+        validatingRef.current = false;
+      }
+    },
+    [classifyAlarm, releaseAnomalyDebounce],
+  );
+
   useEffect(() => {
-    if (!isFocused || appState !== 'active') {
-      if (isMonitoring) stopMonitoring();
-      if (isListening) stopListening();
+    const timestamp = anomaly?.timestamp ?? null;
+    if (timestamp == null || timestamp === lastAnomalyRef.current) {
+      return;
     }
-  }, [isFocused, appState, isListening, isMonitoring, stopListening, stopMonitoring]);
+
+    if (unavailableRetryTimerRef.current) {
+      clearTimeout(unavailableRetryTimerRef.current);
+      unavailableRetryTimerRef.current = null;
+    }
+
+    const current = anomaly;
+    if (!current) return;
+
+    void validateAnomaly(
+      current.pcmSnapshot,
+      current.sampleRate,
+      current.bandLabel,
+      current.timestamp,
+      0,
+    );
+  }, [anomaly?.timestamp, anomaly, validateAnomaly]);
+
+  useEffect(() => {
+    if (!isMonitoring && unavailableRetryTimerRef.current) {
+      clearTimeout(unavailableRetryTimerRef.current);
+      unavailableRetryTimerRef.current = null;
+    }
+  }, [isMonitoring]);
+
+  useEffect(() => {
+    return () => {
+      if (unavailableRetryTimerRef.current) {
+        clearTimeout(unavailableRetryTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleDismissAlert = useCallback(() => {
+    setVerifiedAlert(null);
+    lastAnomalyRef.current = null;
+    dismissAlert();
+  }, [dismissAlert]);
+
+  // --- Stop when navigating away or app backgrounds ---
+  useEffect(() => {
+    if (isFocused && appState === 'active') return;
+
+    if (isMonitoringRef.current) {
+      stopMonitoringRef.current();
+    }
+    if (isListeningRef.current) {
+      void stopListeningRef.current();
+    }
+  }, [isFocused, appState]);
 
   // --- Pulsing dot animation (Reanimated) ---
   const pulseScale = useSharedValue(1);
@@ -113,22 +298,41 @@ export default function HearingScreen() {
   }));
 
   // --- Auto-scroll captions to bottom ---
-  // `onContentSizeChange` fires synchronously after layout, removing the
-  // need for a 100 ms setTimeout that can miss rapid updates.
+  // onContentSizeChange fires synchronously after layout, removing the
+  // need for a setTimeout that can miss rapid updates.
+
+  // --- Debug: log verified alert activations only ---
+  useEffect(() => {
+    if (verifiedAlert) {
+      console.log(
+        `${TAG} ⚠️ VERIFIED ALERT ACTIVATED: type=${verifiedAlert.type} message="${verifiedAlert.message}" confidence=${verifiedAlert.confidence.toFixed(3)}`,
+      );
+    }
+  }, [verifiedAlert]);
+
 
   // --- Toggle handler ---
-  // Start: alarm detector FIRST (grabs mic), then speech recognition.
-  // Stop:  alarm detector FIRST (releases audio session cleanly).
+  // Check BOTH isListening and isMonitoring to avoid double-start race.
+  // Start:  alarm detector FIRST (grabs mic), then speech recognition.
+  // Stop:   alarm detector FIRST (releases audio session cleanly).
+  const isActive = isListening || isMonitoring;
+
   const handleToggle = useCallback(async () => {
+    console.log(`${TAG} handleToggle() | isActive=${isActive} isListening=${isListening} isMonitoring=${isMonitoring}`);
     triggerHaptic('toggle');
-    if (isListening) {
+    if (isActive) {
+      console.log(`${TAG} handleToggle: STOPPING – stopMonitoring then stopListening`);
       stopMonitoring();
       await stopListening();
+      console.log(`${TAG} handleToggle: STOPPED`);
     } else {
+      console.log(`${TAG} handleToggle: STARTING – startMonitoring then startListening`);
       await startMonitoring();
+      console.log(`${TAG} handleToggle: startMonitoring() returned`);
       await startListening();
+      console.log(`${TAG} handleToggle: startListening() returned`);
     }
-  }, [isListening, startListening, stopListening, startMonitoring, stopMonitoring]);
+  }, [isActive, startListening, stopListening, startMonitoring, stopMonitoring]);
 
   // --- Clear handler with haptic ---
   const handleClear = useCallback(() => {
@@ -153,12 +357,13 @@ export default function HearingScreen() {
     <View style={styles.container}>
       <StatusBar style="light" />
 
-      {/* Crisis alert overlay (renders on top of everything when active) */}
+      {/* Crisis alert overlay – renders on top of everything when active */}
       <AlertOverlay
-        alert={alert}
-        onDismiss={dismissAlert}
+        alert={verifiedAlert}
+        onDismiss={handleDismissAlert}
         hapticPatternsEnabled={settings.hapticPatternsEnabled}
       />
+
 
       {/* Unified header */}
       <AtlasHeader
@@ -171,17 +376,17 @@ export default function HearingScreen() {
             <Animated.View
               style={[
                 styles.statusDot,
-                isListening ? styles.statusDotActive : styles.statusDotIdle,
+                isActive ? styles.statusDotActive : styles.statusDotIdle,
                 isListening && pulseStyle,
               ]}
             />
             <Text
               style={[
                 styles.statusLabel,
-                isListening ? styles.statusLabelActive : styles.statusLabelIdle,
+                isActive ? styles.statusLabelActive : styles.statusLabelIdle,
               ]}
             >
-              {isListening ? 'Listening...' : 'Ready'}
+              {isListening ? 'Listening' : isMonitoring ? 'Monitoring' : 'Ready'}
             </Text>
           </View>
         }
@@ -191,8 +396,8 @@ export default function HearingScreen() {
 
         {/* Instruction text */}
         <Text style={styles.instructions}>
-          {isListening
-            ? 'Speak clearly  live captions will appear below.'
+          {isActive
+            ? 'Speak clearly – live captions will appear below.'
             : 'Tap "Start Listening" to begin live captioning.'}
         </Text>
 
@@ -253,7 +458,7 @@ export default function HearingScreen() {
               <Text style={[styles.captionText, { fontSize: settings.captionFontSize }]}>{text}</Text>
             ) : (
               <Text style={styles.placeholderText}>
-                {isListening
+                {isActive
                   ? 'Waiting for speech...'
                   : 'Your transcribed speech will appear here...\n\nTips:\n• Speak clearly and at a normal pace\n• Reduce background noise for best results\n• Each chunk of speech will be transcribed in real time\n• Pauses between speakers are detected automatically'}
               </Text>
@@ -273,13 +478,13 @@ export default function HearingScreen() {
           />
 
           <ActionButton
-            label={isListening ? 'Stop Listening' : 'Start Listening'}
-            icon={isListening ? 'mic-off' : 'mic'}
+            label={isActive ? 'Stop Listening' : 'Start Listening'}
+            icon={isActive ? 'mic-off' : 'mic'}
             iconSize={28}
-            color={isListening ? COLORS.danger : COLORS.primary}
+            color={isActive ? COLORS.danger : COLORS.primary}
             variant="filled"
             onPress={handleToggle}
-            disabled={!isAvailable}
+            disabled={!isAvailable && !isActive}
             fullWidth
           />
         </View>
@@ -306,6 +511,7 @@ const styles = StyleSheet.create({
   statusRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    flexShrink: 0,
   },
   statusDot: {
     width: SIZES.statusDot,
@@ -320,8 +526,9 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.textMuted,
   },
   statusLabel: {
-    fontSize: TYPOGRAPHY.body.fontSize,
+    fontSize: TYPOGRAPHY.caption.fontSize,
     fontWeight: 'bold',
+    flexShrink: 0,
   },
   statusLabelActive: {
     color: COLORS.primary,

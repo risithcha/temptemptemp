@@ -12,7 +12,7 @@
 import { Vibration, Platform } from 'react-native';
 import * as Haptics from 'expo-haptics';
 
-export type HapticPattern = 'fireAlarm' | 'siren' | 'newSpeaker';
+export type HapticPattern = 'fireAlarm' | 'siren' | 'newSpeaker' | 'offlineFallback';
 
 // Android pattern arrays: alternating [pause, vibrate, pause, vibrate, ...]
 const PATTERNS: Record<HapticPattern, number[]> = {
@@ -26,6 +26,8 @@ const PATTERNS: Record<HapticPattern, number[]> = {
   siren: [0, 400, 200, 400, 200, 400, 200, 400],
   // Two gentle taps
   newSpeaker: [0, 50, 60, 50],
+  /** Five short pulses — silent cue that vision fell back to on-device detection. */
+  offlineFallback: [0, 70, 55, 70, 55, 70, 55, 70, 55, 70],
 };
 
 /**
@@ -51,9 +53,27 @@ export function playHapticPattern(pattern: HapticPattern): void {
         case 'newSpeaker':
           Haptics.selectionAsync();
           break;
+        case 'offlineFallback':
+          void playOfflineFallbackHapticIos();
+          break;
       }
     }
   } catch {
     // Haptic feedback is best-effort - never crash the app.
   }
+}
+
+/** Five distinct pulses on iOS (Android uses the offlineFallback pattern array). */
+async function playOfflineFallbackHapticIos(): Promise<void> {
+  for (let i = 0; i < 5; i += 1) {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    if (i < 4) {
+      await new Promise((resolve) => setTimeout(resolve, 55));
+    }
+  }
+}
+
+/** Discreet 5-pulse cue when vision switches to on-device detection. */
+export function playOfflineFallbackHaptic(): void {
+  playHapticPattern('offlineFallback');
 }

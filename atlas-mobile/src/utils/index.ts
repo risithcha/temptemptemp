@@ -13,23 +13,14 @@ export { levenshtein, similarity } from './string_similarity';
 // Pitch estimation (autocorrelation)
 export { estimatePitch, type PitchResult } from './pitch_utils';
 
-// Mel-band energy feature extraction (for (2+N)D speaker clustering)
+// Mel-band energy feature extraction (alarm-suppression feature path)
 export { computeMelBandEnergies, MEL_FILTER_BANK } from './mel_utils';
 
-// Speaker clustering
+// YOLOv8 model output processing
 export {
-  assignSpeaker,
-  median,
-  weightedMedian,
-  type SpeakerProfile,
-  type AssignResult,
-} from './speaker_cluster';
-
-// TensorFlow Lite model output processing
-export {
-  // Decoders
-  decodePredictions,
-  decodeFromRawArrays,
+  // Decoder
+  decodeYolo,
+  labelForClass,
   // Coordinate utils
   toPixelCoordinates,
   getBoxCenter,
@@ -41,12 +32,16 @@ export {
   filterByClass,
   filterByMinArea,
   // Constants
-  COCO_CLASSES,
+  COCO_CLASSES_80,
+  VISION_EXTRA_CLASSES,
+  VISION_ALLOWED_CLASSES,
+  resolveToVisionLabel,
+  visionClassIdForLabel,
   // Types
   type BoundingBox,
   type Detection,
-  type TFLiteOutputs,
-  type DecoderOptions,
+  type YoloCandidates,
+  type YoloDecodeOptions,
   type SpatialDirection,
   type ScreenBox,
   type FrameInfo,
